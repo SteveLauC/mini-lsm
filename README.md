@@ -1,3 +1,6 @@
+# My Solution to LSM in a Week
+
+-----
 # LSM in a Week
 
 [![CI (main)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/mini-lsm/actions/workflows/main.yml)
