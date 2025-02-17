@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::{Bound, DerefMut};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -335,10 +335,20 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let state_snapshot = Arc::clone(&self.state.read());
-        state_snapshot.memtable.put(key, value)?;
+        let state_read_lock = self.state.read();
+        state_read_lock.memtable.put(key, value)?;
+        let memtable_approximate_size = state_read_lock.memtable.approximate_size();
+        // drop the lock after `memtable.put()` to ensure that no threads will
+        // write to a frozen immutable memtable.
+        //
+        // This lock has to be released before `self.state_lock.lock()`, or the
+        // threads that get blockd by `self.state_lock.lock()` will hold a read lock
+        // to `self.state` and stop the first thread that acquires `self.state_lock.lock()`
+        // from freezing the mutable memtable (as `force_freeze_memtable()` needs
+        // a write lock to `self.state`).
+        drop(state_read_lock);
 
-        if state_snapshot.memtable.approximate_size() >= self.options.target_sst_size {
+        if memtable_approximate_size >= self.options.target_sst_size {
             let mutex_guard = self.state_lock.lock();
 
             // re-check
