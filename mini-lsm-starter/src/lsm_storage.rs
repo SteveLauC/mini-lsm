@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::{Bound, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -135,8 +135,19 @@ pub enum CompactionFilter {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    // TODO(steve): figure out the use of `RwLock<Arc<T>>` here
+    // why not `RwLock<LsmStorageState>`
+    //
+    // future steve: it is used for read snapshot, and it can reduce the time
+    // for which the read lock will be held.
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    /// NOTE: With this lock, there will be ONLY 1 thread that will acquire the
+    /// write lock on `state`: `state.write()`
+    ///
+    /// If we don't use this state_lock, then multiple threads will see the mutable
+    /// MemTable is full and try to froze it (`state.write())
     pub(crate) state_lock: Mutex<()>,
+
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
     next_sst_id: AtomicUsize,
@@ -293,8 +304,28 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let state_snapshot = Arc::clone(&self.state.read());
+
+        if let Some(bytes) = state_snapshot.memtable.get(key) {
+            if bytes.is_empty() {
+                return Ok(None);
+            } else {
+                return Ok(Some(bytes));
+            }
+        }
+
+        for imm_memtable in state_snapshot.imm_memtables.iter() {
+            if let Some(bytes) = imm_memtable.get(key) {
+                if bytes.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Ok(Some(bytes));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -303,13 +334,26 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let state_snapshot = Arc::clone(&self.state.read());
+        state_snapshot.memtable.put(key, value)?;
+
+        if state_snapshot.memtable.approximate_size() >= self.options.target_sst_size {
+            let mutex_guard = self.state_lock.lock();
+
+            // re-check
+            let state_snapshot = Arc::clone(&self.state.read());
+            if state_snapshot.memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&mutex_guard)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -334,7 +378,18 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let new_mutable_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+
+        let mut state_write_guard = self.state.write();
+
+        let mut current_state = LsmStorageState::clone(&state_write_guard);
+        let new_immutable_memtale = Arc::clone(&current_state.memtable);
+        current_state.imm_memtables.insert(0, new_immutable_memtale);
+        current_state.memtable = new_mutable_memtable;
+
+        *state_write_guard = Arc::new(current_state);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
