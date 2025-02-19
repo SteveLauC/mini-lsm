@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
+use std::ops::{Deref, DerefMut};
 
 use anyhow::Result;
 
@@ -24,6 +23,8 @@ use crate::key::KeySlice;
 
 use super::StorageIterator;
 
+/// `usize` is the index number of the underlying iterator, smaller index means
+/// newer data.
 struct HeapWrapper<I: StorageIterator>(pub usize, pub Box<I>);
 
 impl<I: StorageIterator> PartialEq for HeapWrapper<I> {
@@ -45,7 +46,14 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
         self.1
             .key()
             .cmp(&other.1.key())
+            // When encountering 2 keys with the same value, prefer the newer
+            // one
             .then(self.0.cmp(&other.0))
+            // `a` is smaller than `b`, but `a` should comes first(SkipMap Range
+            // iter does this). Since `std::collections::BinaryHeap` is a max-heap,
+            // reverse the ordering.
+            //
+            // The same applies to iterator index number as well.
             .reverse()
     }
 }
@@ -54,12 +62,24 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
 /// iterators, prefer the one with smaller index.
 pub struct MergeIterator<I: StorageIterator> {
     iters: BinaryHeap<HeapWrapper<I>>,
+    // Will be None only if the `iters` arg of `create()` is empty
     current: Option<HeapWrapper<I>>,
 }
 
 impl<I: StorageIterator> MergeIterator<I> {
+    // TODO(steve): why Box here?
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut iters: BinaryHeap<HeapWrapper<I>> = iters
+            .into_iter()
+            // filter out invalid iterators
+            .filter(|iter| iter.is_valid())
+            .enumerate()
+            .map(|(idx, iter)| HeapWrapper(idx, iter))
+            .collect();
+
+        let current = iters.pop();
+
+        Self { iters, current }
     }
 }
 
@@ -69,18 +89,57 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current.as_ref().expect("current is None").1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().expect("current is None").1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        match self.current {
+            Some(ref current) => current.1.is_valid(),
+            None => false,
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let key = self.key().into_inner().to_vec();
+
+        // There will be duplicate values in multiple iterators, we need to clear them.
+        while let Some(mut max_iter) = self.iters.peek_mut() {
+            if key == max_iter.1.key().into_inner() {
+                let result = max_iter.1.next();
+                if result.is_err() {
+                    // max_iter is invalid, remove it
+                    PeekMut::pop(max_iter);
+                    // NOTE: an error occurred, but the iterator will not be set to invalid!
+                    return result;
+                }
+
+                if !max_iter.1.is_valid() {
+                    // max_iter is invalid, remove it
+                    PeekMut::pop(max_iter);
+                    continue;
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.current.as_mut().unwrap().1.next()?;
+        // there is no more entires in current
+        if !self.current.as_ref().unwrap().1.is_valid() {
+            self.current = self.iters.pop();
+            return Ok(());
+        }
+
+        if let Some(mut max_in_iters) = self.iters.peek_mut() {
+            if max_in_iters.deref() > self.current.as_ref().unwrap() {
+                std::mem::swap(self.current.as_mut().unwrap(), max_in_iters.deref_mut());
+            }
+        }
+
+        Ok(())
     }
 }

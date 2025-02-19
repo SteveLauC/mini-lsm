@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::Result;
 
 use crate::{
@@ -29,8 +26,26 @@ pub struct LsmIterator {
     inner: LsmIteratorInner,
 }
 
+/// NOTE: one extra thing that `LsmIterator` does is that it filters out deleted
+/// key-value pairs.
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(mut iter: LsmIteratorInner) -> Result<Self> {
+        if !iter.value().is_empty() {
+            return Ok(Self { inner: iter });
+        }
+
+        loop {
+            iter.next()?;
+            if !iter.is_valid() {
+                // Should we return an error instead?
+                break;
+            }
+
+            if !iter.value().is_empty() {
+                break;
+            }
+        }
+
         Ok(Self { inner: iter })
     }
 }
@@ -39,25 +54,40 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().into_inner()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let inner = &mut self.inner;
+
+        loop {
+            inner.next()?;
+            if !inner.is_valid() {
+                break;
+            }
+
+            if !inner.value().is_empty() {
+                break;
+            }
+        }
+
+        Ok(())
     }
 }
 
-/// A wrapper around existing iterator, will prevent users from calling `next` when the iterator is
-/// invalid. If an iterator is already invalid, `next` does not do anything. If `next` returns an error,
-/// `is_valid` should return false, and `next` should always return an error.
+/// A wrapper around existing iterator, will
+///
+/// 1. prevent users from calling `next` when the iterator is invalid. (conflicts with requirement 2)
+/// 2. If an iterator is already invalid, `next` does not do anything.
+/// 3. If `next` returns an error, `is_valid` should return false, and `next` should always return an error.
 pub struct FusedIterator<I: StorageIterator> {
     iter: I,
     has_errored: bool,
@@ -79,18 +109,87 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if self.has_errored {
+            return false;
+        }
+
+        self.iter.is_valid()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if !self.is_valid() {
+            panic!("invalid iterator");
+        }
+
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if !self.is_valid() {
+            panic!("invalid iterator");
+        }
+
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // If an iterator is already invalid, `next` does not do anything.
+        if self.has_errored {
+            return Err(anyhow::anyhow!("error"));
+        }
+
+        if !self.iter.is_valid() {
+            return Ok(());
+        }
+
+        let result = self.iter.next();
+        if result.is_err() {
+            self.has_errored = true;
+            return result;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem_table::MemTable;
+    use bytes::Bytes;
+    use crossbeam_skiplist::SkipMap;
+
+    #[test]
+    fn test_task3_lsm_iterator_ignore_deleted_values() {
+        let skiplist = SkipMap::new();
+        skiplist.insert(Bytes::from("a"), Bytes::from(""));
+        skiplist.insert(Bytes::from("b"), Bytes::from("b"));
+        skiplist.insert(Bytes::from("c"), Bytes::from(""));
+        skiplist.insert(Bytes::from("d"), Bytes::from("d"));
+        let memtable = MemTable::for_testing_from_skiplist(skiplist);
+        let mem_iter = memtable.scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+        let merge_iter = MergeIterator::create(vec![Box::new(mem_iter)]);
+        let mut lsm_iter = LsmIterator::new(merge_iter).unwrap();
+
+        let mut values = Vec::new();
+        loop {
+            let key = std::str::from_utf8(lsm_iter.key()).unwrap().to_string();
+            let value = std::str::from_utf8(lsm_iter.value()).unwrap().to_string();
+            values.push((key, value));
+
+            lsm_iter.next().unwrap();
+
+            if !lsm_iter.is_valid() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            values,
+            vec![
+                ("b".to_string(), "b".to_string()),
+                ("d".to_string(), "d".to_string())
+            ]
+        )
     }
 }

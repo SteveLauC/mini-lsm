@@ -37,6 +37,14 @@ use crate::wal::Wal;
 #[derive(Debug)]
 pub struct MemTable {
     // TODO(steve): why is Arc needed
+    //
+    // future steve:
+    //
+    // Week1/Day2/Task1: Memtable Iterator
+    //
+    // > However, in our case, we do not want to have such lifetimes on our
+    // > iterators to avoid making the system overcomplicated (and hard to
+    // > compile...).
     map: Arc<SkipMap<Bytes, Bytes>>,
     wal: Option<Wal>,
     id: usize,
@@ -54,6 +62,16 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 }
 
 impl MemTable {
+    #[cfg(test)]
+    pub(crate) fn for_testing_from_skiplist(skiplist: SkipMap<Bytes, Bytes>) -> Self {
+        Self {
+            map: Arc::new(skiplist),
+            wal: None,
+            id: 0,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     /// Create a new mem-table.
     pub fn create(id: usize) -> Self {
         Self {
@@ -125,8 +143,23 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        let lower = map_bound(lower);
+        let upper = map_bound(upper);
+
+        let mut memtable_iter = MemTableIteratorBuilder {
+            map: Arc::clone(&self.map),
+            iter_builder: |map| map.range((lower, upper)),
+            // Empty bytes mean invalid state, will be fixed by the `next()` call
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+        // Workaround to fix the initial invalid iterator
+        memtable_iter
+            .next()
+            .expect("failed at the first enxt() call");
+
+        memtable_iter
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
@@ -172,18 +205,33 @@ impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.borrow_item().1
     }
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        KeySlice::from_slice(&self.borrow_item().0)
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.with_mut(|this| {
+            let opt_next_entry = this.iter.next();
+
+            if let Some(next_entry) = opt_next_entry {
+                *this.item = (
+                    Bytes::copy_from_slice(next_entry.key()),
+                    Bytes::copy_from_slice(next_entry.value()),
+                );
+            } else {
+                // Empty bytes mean there is no more entries, `self.is_valid()` should return false
+                this.item.0.clear();
+                this.item.1.clear();
+            }
+        });
+
+        Ok(())
     }
 }

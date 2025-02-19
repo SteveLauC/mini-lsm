@@ -95,7 +95,8 @@ impl StorageIterator for MockIterator {
                 panic!("invalid access after next returns an error!");
             }
         }
-        self.index < self.data.len()
+        let is_valid = self.index < self.data.len();
+        is_valid
     }
 }
 

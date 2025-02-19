@@ -27,10 +27,15 @@ pub trait StorageIterator {
     /// Get the current key.
     fn key(&self) -> Self::KeyType<'_>;
 
-    /// Check if the current iterator is valid.
+    /// `is_valid()` returns if the iterator has reached the end or errored.
     fn is_valid(&self) -> bool;
 
     /// Move to the next position.
+    ///
+    /// If this function returns `Err()`, an error occurred, the iterator is invalid.
+    ///
+    /// If the there is no more entries, the current iterator is invalid, a
+    /// `Ok(())` will be returned in this case.
     fn next(&mut self) -> anyhow::Result<()>;
 
     /// Number of underlying active iterators for this iterator.
