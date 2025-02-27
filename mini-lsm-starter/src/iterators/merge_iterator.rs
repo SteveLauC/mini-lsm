@@ -68,6 +68,8 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     // TODO(steve): why Box here?
+    //
+    // future steve: I think this may be changed to a trait object in the future
     pub fn create(iters: Vec<Box<I>>) -> Self {
         let mut iters: BinaryHeap<HeapWrapper<I>> = iters
             .into_iter()
