@@ -45,6 +45,13 @@ impl BlockBuilder {
         }
     }
 
+    pub(crate) fn size(&self) -> usize {
+        let data_len = self.data.len();
+        let offsets_len = self.offsets.len() * 2;
+
+        data_len + offsets_len
+    }
+
     fn size_with_extra_key_value(&self, key: &KeySlice, value: &[u8]) -> usize {
         let data_len = self.data.len() + 4 + key.len() + value.len();
         let offsets_len = (self.offsets.len() + 1) * 2;

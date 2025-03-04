@@ -24,6 +24,9 @@ pub use iterator::BlockIterator;
 use crate::key::KeySlice;
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
+///
+/// QUES(steve): why do we need to encode the # of elements in the block?
+#[derive(Debug)]
 pub struct Block {
     pub(crate) data: Vec<u8>,
     // This enables us to do binary search even though a block entry is not
@@ -113,7 +116,7 @@ impl Block {
         Some((key, value_range))
     }
 
-    fn last_key(&self) -> KeySlice {
+    pub(crate) fn last_key(&self) -> KeySlice {
         let number_of_elements = self.number_of_elements();
         let i = number_of_elements - 1;
 

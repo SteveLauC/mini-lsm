@@ -143,7 +143,7 @@ impl BlockIterator {
         self.value_range = (value_range.start, value_range.end);
     }
 
-    fn invalidate_iterator(&mut self) {
+    pub(crate) fn invalidate_iterator(&mut self) {
         self.key.clear();
     }
 }
