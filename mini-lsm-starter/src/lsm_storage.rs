@@ -31,11 +31,14 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -326,6 +329,34 @@ impl LsmStorageInner {
             }
         }
 
+        for sstable_id in state_snapshot.l0_sstables.iter() {
+            let sstable = state_snapshot
+                .sstables
+                .get(sstable_id)
+                .expect("SsTable ID not found");
+
+            if sstable.first_key().raw_ref() > key || sstable.last_key().raw_ref() < key {
+                continue;
+            }
+
+            let sstable_iter = SsTableIterator::create_and_seek_to_key(
+                Arc::clone(sstable),
+                KeySlice::from_slice(key),
+            )?;
+
+            if sstable_iter.key().raw_ref() != key {
+                continue;
+            }
+
+            let value = sstable_iter.value();
+
+            if value.is_empty() {
+                return Ok(None);
+            } else {
+                return Ok(Some(Bytes::copy_from_slice(value)));
+            }
+        }
+
         Ok(None)
     }
 
@@ -339,11 +370,11 @@ impl LsmStorageInner {
         let state_read_lock = self.state.read();
         state_read_lock.memtable.put(key, value)?;
         let memtable_approximate_size = state_read_lock.memtable.approximate_size();
-        // drop the lock after `memtable.put()` to ensure that no threads will
+        // hold the state_read_lock after `memtable.put()` to ensure that no threads will
         // write to a frozen immutable memtable.
         //
         // This lock has to be released before `self.state_lock.lock()`, or the
-        // threads that get blockd by `self.state_lock.lock()` will hold a read lock
+        // threads that get blocked by `self.state_lock.lock()` will hold a read lock
         // to `self.state` and stop the first thread that acquires `self.state_lock.lock()`
         // from freezing the mutable memtable (as `force_freeze_memtable()` needs
         // a write lock to `self.state`).
@@ -421,13 +452,46 @@ impl LsmStorageInner {
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = Arc::clone(&self.state.read());
 
-        let mut iters = Vec::new();
-        iters.push(Box::new(state.memtable.scan(lower, upper)));
+        let n_memtable = state.imm_memtables.len() + 1;
+        let mut memtable_iters = Vec::with_capacity(n_memtable);
+        memtable_iters.push(Box::new(state.memtable.scan(lower, upper)));
         for imm_memtable in state.imm_memtables.iter() {
-            iters.push(Box::new(imm_memtable.scan(lower, upper)));
+            memtable_iters.push(Box::new(imm_memtable.scan(lower, upper)));
         }
-        let merged_iter = MergeIterator::create(iters);
-        let lsm_iter = LsmIterator::new(merged_iter).unwrap();
+        let memtable_merge_iter = MergeIterator::create(memtable_iters);
+
+        let n_sstables = state.l0_sstables.len();
+        let mut sstable_iters = Vec::with_capacity(n_sstables);
+        for sstable_idx in state.l0_sstables.iter() {
+            let sstable = state
+                .sstables
+                .get(sstable_idx)
+                .expect("SsTable index not found");
+            let sstable_iter = match lower {
+                Bound::Excluded(bound) => {
+                    let mut iter = SsTableIterator::create_and_seek_to_key(
+                        Arc::clone(sstable),
+                        KeySlice::from_slice(bound),
+                    )?;
+                    if iter.key().raw_ref() == bound {
+                        iter.next()?;
+                    }
+
+                    iter
+                }
+                Bound::Included(bound) => SsTableIterator::create_and_seek_to_key(
+                    Arc::clone(sstable),
+                    KeySlice::from_slice(bound),
+                )?,
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(Arc::clone(sstable))?,
+            };
+
+            sstable_iters.push(Box::new(sstable_iter));
+        }
+        let sstable_merge_iter = MergeIterator::create(sstable_iters);
+
+        let two_merge_iter = TwoMergeIterator::create(memtable_merge_iter, sstable_merge_iter)?;
+        let lsm_iter = LsmIterator::new(two_merge_iter, upper)?;
 
         Ok(FusedIterator::new(lsm_iter))
     }

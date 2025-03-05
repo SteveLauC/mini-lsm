@@ -15,38 +15,70 @@
 use anyhow::Result;
 
 use crate::{
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
+    iterators::{
+        merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator, StorageIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
+use std::ops::Bound;
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+
+    upper_bound: Bound<Vec<u8>>,
+    reached_upper_bound: bool,
 }
 
 /// NOTE: one extra thing that `LsmIterator` does is that it filters out deleted
 /// key-value pairs.
 impl LsmIterator {
-    pub(crate) fn new(mut iter: LsmIteratorInner) -> Result<Self> {
-        if !iter.value().is_empty() {
-            return Ok(Self { inner: iter });
+    pub(crate) fn new(mut iter: LsmIteratorInner, upper_bound: Bound<&[u8]>) -> Result<Self> {
+        let upper_bound = match upper_bound {
+            Bound::Excluded(slice) => Bound::Excluded(slice.to_vec()),
+            Bound::Included(slice) => Bound::Included(slice.to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        if !iter.is_valid() {
+            return Ok(Self {
+                inner: iter,
+                upper_bound,
+                reached_upper_bound: false,
+            });
         }
 
+        // filter deleted key-value pairs
         loop {
-            iter.next()?;
-            if !iter.is_valid() {
-                // Should we return an error instead?
-                break;
-            }
-
             if !iter.value().is_empty() {
                 break;
             }
+
+            iter.next()?;
+            if !iter.is_valid() {
+                return Ok(Self {
+                    inner: iter,
+                    upper_bound,
+                    reached_upper_bound: false,
+                });
+            }
         }
 
-        Ok(Self { inner: iter })
+        let reached_upper_bound = match &upper_bound {
+            Bound::Excluded(bound) => iter.key().raw_ref() >= bound.as_slice(),
+            Bound::Included(bound) => iter.key().raw_ref() > bound.as_slice(),
+            Bound::Unbounded => false,
+        };
+
+        Ok(Self {
+            inner: iter,
+            upper_bound,
+            reached_upper_bound,
+        })
     }
 }
 
@@ -54,7 +86,7 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        self.inner.is_valid() && !self.reached_upper_bound
     }
 
     fn key(&self) -> &[u8] {
@@ -66,18 +98,29 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        if !self.is_valid() {
+            return Ok(());
+        }
+
         let inner = &mut self.inner;
 
+        // filter deleted key-value pairs
         loop {
             inner.next()?;
             if !inner.is_valid() {
-                break;
+                return Ok(());
             }
 
             if !inner.value().is_empty() {
                 break;
             }
         }
+
+        self.reached_upper_bound = match &self.upper_bound {
+            Bound::Excluded(bound) => inner.key().raw_ref() >= bound.as_slice(),
+            Bound::Included(bound) => inner.key().raw_ref() > bound.as_slice(),
+            Bound::Unbounded => false,
+        };
 
         Ok(())
     }
@@ -155,12 +198,16 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mem_table::MemTable;
+    use crate::{key::KeySlice, mem_table::MemTable, table::SsTableBuilder};
     use bytes::Bytes;
     use crossbeam_skiplist::SkipMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     #[test]
     fn test_task3_lsm_iterator_ignore_deleted_values() {
+        let temp_dir = tempdir().unwrap();
+
         let skiplist = SkipMap::new();
         skiplist.insert(Bytes::from("a"), Bytes::from(""));
         skiplist.insert(Bytes::from("b"), Bytes::from("b"));
@@ -168,8 +215,20 @@ mod tests {
         skiplist.insert(Bytes::from("d"), Bytes::from("d"));
         let memtable = MemTable::for_testing_from_skiplist(skiplist);
         let mem_iter = memtable.scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-        let merge_iter = MergeIterator::create(vec![Box::new(mem_iter)]);
-        let mut lsm_iter = LsmIterator::new(merge_iter).unwrap();
+        let merge_iter_a = MergeIterator::create(vec![Box::new(mem_iter)]);
+
+        let mut sstable_builder = SsTableBuilder::new(4096);
+        sstable_builder.add(KeySlice::from_slice("c".as_bytes()), "sstable".as_bytes());
+        sstable_builder.add(KeySlice::from_slice("e".as_bytes()), "sstable".as_bytes());
+        let sstable = sstable_builder
+            .build(0, None, temp_dir.path().join("sstable"))
+            .unwrap();
+        let sstable_iter = SsTableIterator::create_and_seek_to_first(Arc::new(sstable)).unwrap();
+        let merge_iter_b = MergeIterator::create(vec![Box::new(sstable_iter)]);
+
+        let two_merge_iter = TwoMergeIterator::create(merge_iter_a, merge_iter_b).unwrap();
+
+        let mut lsm_iter = LsmIterator::new(two_merge_iter, Bound::Unbounded).unwrap();
 
         let mut values = Vec::new();
         loop {
@@ -188,7 +247,8 @@ mod tests {
             values,
             vec![
                 ("b".to_string(), "b".to_string()),
-                ("d".to_string(), "d".to_string())
+                ("d".to_string(), "d".to_string()),
+                ("e".to_string(), "sstable".to_string())
             ]
         )
     }

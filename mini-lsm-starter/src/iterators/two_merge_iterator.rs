@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::Result;
 
 use super::StorageIterator;
@@ -24,7 +21,13 @@ use super::StorageIterator;
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
-    // Add fields as need
+
+    current: Current,
+}
+
+enum Current {
+    A,
+    B,
 }
 
 impl<
@@ -33,7 +36,23 @@ impl<
     > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let current = match (a.is_valid(), b.is_valid()) {
+            (true, true) => {
+                if a.key() <= b.key() {
+                    Current::A
+                } else {
+                    Current::B
+                }
+            }
+            (true, false) => Current::A,
+            (false, true) => Current::B,
+            (false, false) => {
+                // does not matter
+                Current::A
+            }
+        };
+
+        Ok(Self { a, b, current })
     }
 }
 
@@ -45,18 +64,67 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        match self.current {
+            Current::A => self.a.key(),
+            Current::B => self.b.key(),
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        match self.current {
+            Current::A => self.a.value(),
+            Current::B => self.b.value(),
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        match self.current {
+            Current::A => self.a.is_valid(),
+            Current::B => self.b.is_valid(),
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid() {
+            return Ok(());
+        }
+
+        match self.current {
+            Current::A => {
+                if self.b.is_valid() && self.key() == self.b.key() {
+                    self.b.next()?;
+                }
+            }
+            Current::B => {}
+        }
+
+        match self.current {
+            Current::A => {
+                self.a.next()?;
+            }
+            Current::B => {
+                self.b.next()?;
+            }
+        }
+
+        match (self.a.is_valid(), self.b.is_valid()) {
+            (false, false) => { /* do nothing, the iterator is invalid now */ }
+            (true, false) => {
+                self.current = Current::A;
+            }
+            (false, true) => {
+                self.current = Current::B;
+            }
+            (true, true) => {
+                let current = if self.a.key() <= self.b.key() {
+                    Current::A
+                } else {
+                    Current::B
+                };
+                self.current = current;
+            }
+        }
+
+        Ok(())
     }
 }
