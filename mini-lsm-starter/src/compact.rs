@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 mod leveled;
 mod simple_leveled;
 mod tiered;
@@ -161,6 +158,11 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
+        let state = Arc::clone(&self.state.read());
+        if state.imm_memtables.len() + 1 >= self.options.num_memtable_limit {
+            self.force_flush_next_imm_memtable()?;
+        }
+
         Ok(())
     }
 

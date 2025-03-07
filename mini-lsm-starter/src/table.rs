@@ -17,6 +17,7 @@ mod builder;
 mod iterator;
 
 use std::fs::File;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -285,6 +286,32 @@ impl SsTable {
     pub fn max_ts(&self) -> u64 {
         self.max_ts
     }
+
+    /// The data contained in an SsTable has a range, check if it overlaps with
+    /// the range specified by `lower` and `upper`.
+    pub(crate) fn range_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        // lower <= sst.last_key && sst.first_key <= upper
+        let first_key = self.first_key.raw_ref();
+        let last_key = self.last_key.raw_ref();
+
+        let lower_le_last_key = {
+            match lower {
+                Bound::Excluded(l) => l < last_key,
+                Bound::Included(l) => l <= last_key,
+                Bound::Unbounded => true,
+            }
+        };
+
+        let first_key_le_upper = {
+            match upper {
+                Bound::Excluded(u) => first_key < u,
+                Bound::Included(u) => first_key <= u,
+                Bound::Unbounded => true,
+            }
+        };
+
+        lower_le_last_key && first_key_le_upper
+    }
 }
 
 #[cfg(test)]
@@ -316,7 +343,7 @@ mod tests {
             first_key: KeyBytes::from_bytes(Bytes::from_static(b"first_key")),
             last_key: KeyBytes::from_bytes(Bytes::from_static(b"last_key")),
         };
-        let block_metas: Vec<BlockMeta> = (0..20).into_iter().map(|_| block_meta.clone()).collect();
+        let block_metas: Vec<BlockMeta> = (0..20).map(|_| block_meta.clone()).collect();
 
         let mut buf: Vec<u8> = Vec::new();
 
@@ -324,5 +351,26 @@ mod tests {
         let decoded = BlockMeta::decode_block_meta(buf.as_slice());
 
         assert_eq!(block_metas, decoded);
+    }
+
+    #[test]
+    fn test_range_overlap() {
+        let sst = SsTable::create_meta_only(
+            0,
+            0,
+            KeyBytes::from_bytes("b".into()),
+            KeyBytes::from_bytes("c".into()),
+        );
+
+        assert!(sst.range_overlap(Bound::Unbounded, Bound::Unbounded));
+        assert!(!sst.range_overlap(Bound::Excluded("c".as_bytes()), Bound::Unbounded));
+        assert!(!sst.range_overlap(Bound::Unbounded, Bound::Excluded("b".as_bytes())));
+        assert!(!sst.range_overlap(Bound::Included("d".as_bytes()), Bound::Unbounded));
+        assert!(!sst.range_overlap(Bound::Unbounded, Bound::Included("a".as_bytes())));
+
+        assert!(sst.range_overlap(Bound::Included("c".as_bytes()), Bound::Unbounded));
+        assert!(sst.range_overlap(Bound::Excluded("a".as_bytes()), Bound::Unbounded));
+        assert!(sst.range_overlap(Bound::Unbounded, Bound::Included("b".as_bytes())));
+        assert!(sst.range_overlap(Bound::Unbounded, Bound::Excluded("d".as_bytes())));
     }
 }

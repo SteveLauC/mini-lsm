@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -38,7 +36,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -184,7 +182,17 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(())?;
+        self.flush_thread
+            .lock()
+            .take()
+            .expect("should be Some")
+            .join()
+            .expect("failed to wait for the flush thread to exit");
+
+        // TODO: do the same to the compaction thread.
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -267,8 +275,6 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
-        let state = LsmStorageState::create(&options);
-
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
@@ -282,20 +288,87 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
-        let storage = Self {
-            state: Arc::new(RwLock::new(Arc::new(state))),
-            state_lock: Mutex::new(()),
-            path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
-            next_sst_id: AtomicUsize::new(1),
-            compaction_controller,
-            manifest: None,
-            options: options.into(),
-            mvcc: None,
-            compaction_filters: Arc::new(Mutex::new(Vec::new())),
-        };
+        if path.try_exists()? {
+            let mut l0_sstables = Vec::new();
+            let mut sstables = HashMap::new();
+            let sst_file_extension = OsStr::new("sst");
 
-        Ok(storage)
+            let dir = std::fs::read_dir(path)?;
+            for res_entry in dir {
+                let entry = res_entry?;
+                let entry_path = entry.path();
+                if Some(sst_file_extension) == entry_path.extension() {
+                    let sstable_id = entry_path
+                        .file_stem()
+                        .expect("should be some since it has file extension")
+                        .to_str()
+                        .expect("utf8 encoded")
+                        .parse::<usize>()
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "failed to parse '{:?}' as a number: {}",
+                                entry_path.file_stem().unwrap(),
+                                err
+                            )
+                        });
+
+                    let file_object = FileObject::open(&entry_path)?;
+                    let sstable = Arc::new(SsTable::open(
+                        sstable_id,
+                        Some(Arc::new(BlockCache::new(4096))),
+                        file_object,
+                    )?);
+
+                    l0_sstables.push(sstable_id);
+                    sstables.insert(sstable_id, sstable);
+                }
+            }
+
+            // sort the IDs in descending order
+            l0_sstables.sort_by(|a, b| b.cmp(a));
+
+            let memtable_id = l0_sstables.first().copied().unwrap_or(0);
+            let next_sst_id = memtable_id + 1;
+
+            let state = Arc::new(RwLock::new(Arc::new(LsmStorageState {
+                memtable: Arc::new(MemTable::create(memtable_id)),
+                imm_memtables: Vec::new(),
+                l0_sstables,
+                levels: Vec::new(),
+                sstables,
+            })));
+
+            Ok(Self {
+                state,
+                state_lock: Mutex::new(()),
+                path: path.to_path_buf(),
+                block_cache: Arc::new(BlockCache::new(1024)),
+                next_sst_id: AtomicUsize::new(next_sst_id),
+                compaction_controller,
+                manifest: None,
+                options: options.into(),
+                mvcc: None,
+                compaction_filters: Arc::new(Mutex::new(Vec::new())),
+            })
+        } else {
+            std::fs::create_dir_all(path)?;
+            let state = LsmStorageState::create(&options);
+
+            let storage = Self {
+                state: Arc::new(RwLock::new(Arc::new(state))),
+                state_lock: Mutex::new(()),
+                path: path.to_path_buf(),
+                block_cache: Arc::new(BlockCache::new(1024)),
+                next_sst_id: AtomicUsize::new(1),
+                compaction_controller,
+                manifest: None,
+                options: options.into(),
+                mvcc: None,
+                compaction_filters: Arc::new(Mutex::new(Vec::new())),
+            };
+
+            Ok(storage)
+        }
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -436,7 +509,30 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_write_guard = self.state_lock.lock();
+
+        let state_snapshot = Arc::clone(&self.state.read());
+        let earliest_immutable_memtable = state_snapshot
+            .imm_memtables
+            .last()
+            .expect("no immutable memtable found");
+
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        earliest_immutable_memtable.flush(&mut sst_builder)?;
+        let sst_id = earliest_immutable_memtable.id();
+        let sstable = sst_builder.build(
+            sst_id,
+            Some(Arc::new(BlockCache::new(4096))),
+            self.path_of_sst(sst_id),
+        )?;
+
+        let mut new_state = LsmStorageState::clone(&state_snapshot);
+        new_state.imm_memtables.pop();
+        new_state.l0_sstables.insert(0, sst_id);
+        new_state.sstables.insert(sst_id, Arc::new(sstable));
+        *self.state.write() = Arc::new(new_state);
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -467,6 +563,12 @@ impl LsmStorageInner {
                 .sstables
                 .get(sstable_idx)
                 .expect("SsTable index not found");
+
+            // filter out SsTables that do not overlap with the specified range
+            if !sstable.range_overlap(lower, upper) {
+                continue;
+            }
+
             let sstable_iter = match lower {
                 Bound::Excluded(bound) => {
                     let mut iter = SsTableIterator::create_and_seek_to_key(

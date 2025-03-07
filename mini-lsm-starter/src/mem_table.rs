@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
@@ -162,9 +159,15 @@ impl MemTable {
         memtable_iter
     }
 
-    /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+    /// Flush the mem-table to SSTable.
+    pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        for entry in self.map.iter() {
+            let key = entry.key();
+            let value = entry.value();
+            builder.add(KeySlice::from_slice(key), value);
+        }
+
+        Ok(())
     }
 
     pub fn id(&self) -> usize {
@@ -198,6 +201,8 @@ pub struct MemTableIterator {
     #[not_covariant]
     iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
+    ///
+    /// If item.0 is empty, then this iterator is invalid.
     item: (Bytes, Bytes),
 }
 
@@ -205,10 +210,18 @@ impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
+        if !self.is_valid() {
+            panic!("MemTableIterator::value() invoked on an invalid iterator");
+        }
+
         &self.borrow_item().1
     }
 
     fn key(&self) -> KeySlice {
+        if !self.is_valid() {
+            panic!("MemTableIterator::key() invoked on an invalid iterator");
+        }
+
         KeySlice::from_slice(&self.borrow_item().0)
     }
 
@@ -233,5 +246,9 @@ impl StorageIterator for MemTableIterator {
         });
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        1
     }
 }

@@ -67,9 +67,6 @@ pub struct MergeIterator<I: StorageIterator> {
 }
 
 impl<I: StorageIterator> MergeIterator<I> {
-    // TODO(steve): why Box here?
-    //
-    // future steve: I think this may be changed to a trait object in the future
     pub fn create(iters: Vec<Box<I>>) -> Self {
         let mut iters: BinaryHeap<HeapWrapper<I>> = iters
             .into_iter()
@@ -91,10 +88,18 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
+        if !self.is_valid() {
+            panic!("MergeIterator::key() invoked on an invalid iterator");
+        }
+
         self.current.as_ref().expect("current is None").1.key()
     }
 
     fn value(&self) -> &[u8] {
+        if !self.is_valid() {
+            panic!("MergeIterator::value() invoked on an invalid iterator");
+        }
+
         self.current.as_ref().expect("current is None").1.value()
     }
 
@@ -143,5 +148,18 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        if !self.is_valid() {
+            return 0;
+        }
+
+        let iters: usize = self
+            .iters
+            .iter()
+            .map(|iter| iter.1.num_active_iterators())
+            .sum();
+        iters + self.current.as_ref().unwrap().1.num_active_iterators()
     }
 }

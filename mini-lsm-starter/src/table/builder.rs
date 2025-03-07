@@ -130,8 +130,14 @@ impl SsTableBuilder {
             .write(true)
             .read(true)
             .create_new(true)
-            .open(path)
-            .expect("open");
+            .open(path.as_ref())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "I/O error while creating and opening {}",
+                    path.as_ref().display()
+                )
+            });
+
         let data = self.data;
         sst_file.write_all(data.as_slice()).expect("write");
         let block_meta_offset = data.len() as u32;

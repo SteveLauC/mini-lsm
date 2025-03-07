@@ -127,4 +127,19 @@ impl<
 
         Ok(())
     }
+
+    fn num_active_iterators(&self) -> usize {
+        let a = if self.a.is_valid() {
+            self.a.num_active_iterators()
+        } else {
+            0
+        };
+        let b = if self.b.is_valid() {
+            self.b.num_active_iterators()
+        } else {
+            0
+        };
+
+        a + b
+    }
 }

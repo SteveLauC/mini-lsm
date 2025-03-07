@@ -173,4 +173,8 @@ impl StorageIterator for SsTableIterator {
 
         Ok(())
     }
+
+    fn num_active_iterators(&self) -> usize {
+        1
+    }
 }
