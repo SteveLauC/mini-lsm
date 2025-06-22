@@ -37,11 +37,12 @@ pub struct BlockIterator {
 }
 
 impl BlockIterator {
+    /// The cursor will be placed on the first key-value pair.
     fn new(block: Arc<Block>) -> Self {
         let (key, value_range) = block
             .ith_key_and_value_range(0)
             .expect("0 should be in range");
-        let key = key.to_key_vec();
+        let key = key;
 
         Self {
             block,
@@ -113,14 +114,14 @@ impl BlockIterator {
             return;
         }
 
-        if key > self.block.last_key() {
+        if key > self.block.last_key().as_key_slice() {
             self.invalidate_iterator();
             return;
         }
 
         // do binary search
         let index = match self.block.offsets.binary_search_by(|offset| {
-            unsafe { self.block.decode_key_at_offset(*offset) }.cmp(&key)
+            self.block.decode_key_at_offset(*offset as usize).as_key_slice().cmp(&key)
         }) {
             Ok(i) => i,
             Err(i) => i,
@@ -130,15 +131,15 @@ impl BlockIterator {
     }
 
     fn seek_to_ith(&mut self, i: usize) {
-        let Some((key, value_range)) = self.block.ith_key_and_value_range(i) else {
-            panic!("i out of range");
-        };
-
         if self.idx == i {
             return;
         }
 
-        self.key = key.to_key_vec();
+        let Some((key, value_range)) = self.block.ith_key_and_value_range(i) else {
+            panic!("i out of range");
+        };
+
+        self.key = key;
         self.idx = i;
         self.value_range = (value_range.start, value_range.end);
     }
@@ -155,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_name() {
+    fn test_iterating_all_elements() {
         let mut builder = BlockBuilder::new(4096);
         assert!(builder.add(KeySlice::from_slice("a".as_bytes()), "a".as_bytes()));
         assert!(builder.add(KeySlice::from_slice("b".as_bytes()), "b".as_bytes()));
@@ -164,6 +165,7 @@ mod tests {
 
         let mut iter = BlockIterator::new(Arc::new(block));
 
+        let mut kv_pairs = Vec::new();
         loop {
             if !iter.is_valid() {
                 break;
@@ -171,10 +173,47 @@ mod tests {
 
             let key = iter.key();
             let value = iter.value();
-            println!("{:?}:{:?}", key, value);
+            // .to_vec() to drop reference
+            kv_pairs.push((key.raw_ref().to_vec(), value.to_vec()));
 
             iter.next();
         }
+
+        assert_eq!(kv_pairs.len(), 3);
+        assert_eq!(kv_pairs[0], (b"a".to_vec(), b"a".to_vec()));
+        assert_eq!(kv_pairs[1], (b"b".to_vec(), b"b".to_vec()));
+        assert_eq!(kv_pairs[2], (b"c".to_vec(), b"c".to_vec()));
+    }
+
+
+    #[test]
+    fn test_iterating_all_elements_with_common_prefix() {
+        let mut builder = BlockBuilder::new(4096);
+        assert!(builder.add(KeySlice::from_slice("prefix-a".as_bytes()), "a".as_bytes()));
+        assert!(builder.add(KeySlice::from_slice("prefix-b".as_bytes()), "b".as_bytes()));
+        assert!(builder.add(KeySlice::from_slice("prefix-c".as_bytes()), "c".as_bytes()));
+        let block = builder.build();
+
+        let mut iter = BlockIterator::new(Arc::new(block));
+
+        let mut kv_pairs = Vec::new();
+        loop {
+            if !iter.is_valid() {
+                break;
+            }
+
+            let key = iter.key();
+            let value = iter.value();
+            // .to_vec() to drop reference
+            kv_pairs.push((key.raw_ref().to_vec(), value.to_vec()));
+
+            iter.next();
+        }
+
+        assert_eq!(kv_pairs.len(), 3);
+        assert_eq!(kv_pairs[0], (b"prefix-a".to_vec(), b"a".to_vec()));
+        assert_eq!(kv_pairs[1], (b"prefix-b".to_vec(), b"b".to_vec()));
+        assert_eq!(kv_pairs[2], (b"prefix-c".to_vec(), b"c".to_vec()));
     }
 
     #[test]

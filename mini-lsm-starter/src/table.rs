@@ -17,7 +17,9 @@ mod builder;
 mod iterator;
 
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Bound;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -156,16 +158,29 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let sst_file_len = file.1;
-        let block_meta_offset = u32::from_le_bytes(
-            file.read(sst_file_len - 4, std::mem::size_of::<u32>() as u64)
-                .expect("read")
-                .try_into()
-                .unwrap(),
-        ) as u64;
+        const OFFSET_SIZE: usize = std::mem::size_of::<u32>();
 
-        let block_meta_len = sst_file_len - block_meta_offset - std::mem::size_of::<u32>() as u64;
-        let block_meta_bytes = file.read(block_meta_offset, block_meta_len).expect("read");
-        let block_meta = BlockMeta::decode_block_meta(block_meta_bytes.as_slice());
+        let mut offset_buffer = [0_u8; OFFSET_SIZE];
+        let mut buffer = Vec::new();
+
+        // bloom filter
+        let file = file.0.expect("FileObject's File field is None");
+        file.read_exact_at(&mut offset_buffer, sst_file_len - OFFSET_SIZE as u64)?;
+        let bloom_filter_offset = u32::from_le_bytes(offset_buffer);
+        let bloom_filter_bytes_len =
+            sst_file_len as usize - bloom_filter_offset as usize - OFFSET_SIZE;
+        buffer.resize(bloom_filter_bytes_len, 0);
+        file.read_exact_at(&mut buffer, bloom_filter_offset as u64)?;
+        let bloom_filter = Bloom::decode(buffer.as_slice());
+
+        // block meta
+        let block_meta_offset_offset = bloom_filter_offset as u64 - OFFSET_SIZE as u64;
+        file.read_exact_at(&mut offset_buffer, block_meta_offset_offset)?;
+        let block_meta_offset = u32::from_le_bytes(offset_buffer);
+        let block_meta_bytes_len = block_meta_offset_offset - block_meta_offset as u64;
+        buffer.resize(block_meta_bytes_len as usize, 0);
+        file.read_exact_at(&mut buffer, block_meta_offset as u64)?;
+        let block_meta = BlockMeta::decode_block_meta(buffer.as_slice());
 
         let first_key = block_meta
             .first()
@@ -179,14 +194,14 @@ impl SsTable {
             .clone();
 
         Ok(Self {
-            file,
+            file: FileObject(Some(file), sst_file_len),
             block_meta,
             block_meta_offset: block_meta_offset as usize,
             id,
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom_filter),
             // TODO(steve): should be updated in week 3
             max_ts: 0,
         })

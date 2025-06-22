@@ -12,108 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
+use std::io::Write;
 
 use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
 
-/// Implements a bloom filter
-#[derive(Debug)]
-pub struct Bloom {
-    /// data of filter in bits
-    pub(crate) filter: Bytes,
-    /// number of hash functions
-    pub(crate) k: u8,
-}
 
-pub trait BitSlice {
-    fn get_bit(&self, idx: usize) -> bool;
-    fn bit_len(&self) -> usize;
-}
+pub struct Bloom(pub fastbloom::BloomFilter<xxhash_rust::xxh64::Xxh64Builder>);
 
-pub trait BitSliceMut {
-    fn set_bit(&mut self, idx: usize, val: bool);
-}
 
-impl<T: AsRef<[u8]>> BitSlice for T {
-    fn get_bit(&self, idx: usize) -> bool {
-        let pos = idx / 8;
-        let offset = idx % 8;
-        (self.as_ref()[pos] & (1 << offset)) != 0
-    }
-
-    fn bit_len(&self) -> usize {
-        self.as_ref().len() * 8
-    }
-}
-
-impl<T: AsMut<[u8]>> BitSliceMut for T {
-    fn set_bit(&mut self, idx: usize, val: bool) {
-        let pos = idx / 8;
-        let offset = idx % 8;
-        if val {
-            self.as_mut()[pos] |= 1 << offset;
-        } else {
-            self.as_mut()[pos] &= !(1 << offset);
-        }
+impl std::fmt::Debug for Bloom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bloom")
     }
 }
 
 impl Bloom {
-    /// Decode a bloom filter
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        let filter = &buf[..buf.len() - 1];
-        let k = buf[buf.len() - 1];
-        Ok(Self {
-            filter: filter.to_vec().into(),
-            k,
-        })
+    pub fn new() -> Self {
+        Bloom(fastbloom::BloomFilter::with_num_bits(1024).hasher(xxhash_rust::xxh64::Xxh64Builder::new(0)).expected_items(1024))
     }
 
-    /// Encode a bloom filter
-    pub fn encode(&self, buf: &mut Vec<u8>) {
-        buf.extend(&self.filter);
-        buf.put_u8(self.k);
+    pub fn encode(&self, mut to: impl Write) -> Result<()> {
+        let slice: &[u64] = self.0.as_slice();
+        // slice.len() * 8 because slice contains u64 but we need u8
+        let bytes =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), slice.len() * 8) };
+
+        to.write_all(bytes)?;
+
+        Ok(())
     }
 
-    /// Get bloom filter bits per key from entries count and FPR
-    pub fn bloom_bits_per_key(entries: usize, false_positive_rate: f64) -> usize {
-        let size =
-            -1.0 * (entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
-        let locs = (size / (entries as f64)).ceil();
-        locs as usize
-    }
+    pub fn decode(bytes: &[u8]) -> Self {
+        // Ensure the bytes length is a multiple of 8 (size of u64)
+        assert_eq!(bytes.len() % 8, 0, "Bytes length must be a multiple of 8");
 
-    /// Build bloom filter from key hashes
-    pub fn build_from_key_hashes(keys: &[u32], bits_per_key: usize) -> Self {
-        let k = (bits_per_key as f64 * 0.69) as u32;
-        let k = k.clamp(1, 30);
-        let nbits = (keys.len() * bits_per_key).max(64);
-        let nbytes = (nbits + 7) / 8;
-        let nbits = nbytes * 8;
-        let mut filter = BytesMut::with_capacity(nbytes);
-        filter.resize(nbytes, 0);
+        let slice: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
 
-        // TODO: build the bloom filter
+        let bloom = fastbloom::BloomFilter::from_vec(slice).hasher(xxhash_rust::xxh64::Xxh64Builder::new(0)).expected_items(1024);
 
-        Self {
-            filter: filter.freeze(),
-            k: k as u8,
-        }
-    }
-
-    /// Check if a bloom filter may contain some data
-    pub fn may_contain(&self, h: u32) -> bool {
-        if self.k > 30 {
-            // potential new encoding for short bloom filters
-            true
-        } else {
-            let nbits = self.filter.bit_len();
-            let delta = h.rotate_left(15);
-
-            // TODO: probe the bloom filter
-
-            true
-        }
+        Self(bloom)
     }
 }

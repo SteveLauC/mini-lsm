@@ -147,7 +147,7 @@ pub(crate) struct LsmStorageInner {
     /// write lock on `state`: `state.write()`
     ///
     /// If we don't use this state_lock, then multiple threads will see the mutable
-    /// MemTable is full and try to froze it (`state.write())
+    /// MemTable is full and try to froze it (`state.write()), which would affect writes.
     pub(crate) state_lock: Mutex<()>,
 
     path: PathBuf,
@@ -407,6 +407,12 @@ impl LsmStorageInner {
                 .sstables
                 .get(sstable_id)
                 .expect("SsTable ID not found");
+
+            if let Some(ref bloom_filter) = sstable.bloom {
+                if !bloom_filter.0.contains(key) {
+                    continue;
+                }
+            }
 
             if sstable.first_key().raw_ref() > key || sstable.last_key().raw_ref() < key {
                 continue;

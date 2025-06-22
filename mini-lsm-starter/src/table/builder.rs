@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use super::bloom::Bloom;
 use super::{BlockMeta, SsTable};
 use crate::key::KeyBytes;
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
@@ -31,6 +32,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    bloom_filter: Bloom,
 }
 
 impl SsTableBuilder {
@@ -44,6 +46,7 @@ impl SsTableBuilder {
             data: Vec::with_capacity(1024 * 1024 * 256),
             meta: Vec::new(),
             block_size,
+            bloom_filter: Bloom::new()
         }
     }
 
@@ -60,6 +63,7 @@ impl SsTableBuilder {
                     self.first_key = key.raw_ref().to_vec();
                 }
                 self.last_key = key.raw_ref().to_vec();
+                self.bloom_filter.0.insert(key.raw_ref());
 
                 break;
             } else {
@@ -106,6 +110,7 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
+        // This block is not full
         if self.builder.size() != 0 {
             let block = self.builder.build();
             let block_bytes = block.encode();
@@ -138,26 +143,31 @@ impl SsTableBuilder {
                 )
             });
 
-        let data = self.data;
-        sst_file.write_all(data.as_slice()).expect("write");
-        let block_meta_offset = data.len() as u32;
-        drop(data);
+        let mut data = self.data;
 
         if self.meta.is_empty() {
             panic!("trying to build an empty SsTable");
         }
 
-        let mut meta_bytes = Vec::new();
-        BlockMeta::encode_block_meta(self.meta.as_slice(), &mut meta_bytes);
-        sst_file.write_all(&meta_bytes).expect("write");
+        // block meta
+        let block_meta_offset = data.len() as u32;
+        BlockMeta::encode_block_meta(self.meta.as_slice(), &mut data);
+        data.write_all(&block_meta_offset.to_le_bytes()).unwrap();
 
-        sst_file
-            .write_all(&block_meta_offset.to_le_bytes())
-            .expect("write");
+        // bloom filter
+        let bloom_filter_offset = data.len() as u32;
+        self.bloom_filter.encode(&mut data)?;
+        data.write_all(&bloom_filter_offset.to_le_bytes()).unwrap();
 
-        let file_len = sst_file.metadata().expect("stat").len();
+        sst_file.write_all(&data).expect("write");
 
-        SsTable::open(id, block_cache, super::FileObject(Some(sst_file), file_len))
+        let file_len = data.len();
+
+        SsTable::open(
+            id,
+            block_cache,
+            super::FileObject(Some(sst_file), file_len as u64),
+        )
     }
 
     #[cfg(test)]
