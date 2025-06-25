@@ -24,6 +24,7 @@ pub mod mem_table;
 pub mod mvcc;
 pub mod table;
 pub mod wal;
+pub mod utils;
 
 #[cfg(test)]
 mod tests;

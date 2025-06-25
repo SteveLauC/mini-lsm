@@ -551,6 +551,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mini-lsm-starter-playground"
+version = "0.2.0"
+dependencies = [
+ "mini-lsm-starter",
+]
+
+[[package]]
 name = "mini-lsm-xtask"
 version = "0.2.0"
 dependencies = [
